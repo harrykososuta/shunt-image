@@ -1,62 +1,69 @@
-# easyocr_app.py
-# 画像からシャント機能評価パラメータをEasyOCRで抽出
+# ocr_streamlit_app.py
 
 import streamlit as st
-import cv2
-import numpy as np
 import easyocr
+import numpy as np
 from PIL import Image
+import cv2
 import re
 
-# EasyOCR reader 初期化（英語）
-reader = easyocr.Reader(['en'], gpu=False)
+# EasyOCR Reader
+reader = easyocr.Reader(['en'])  # 英語モデルのみ
 
-st.set_page_config(page_title="EasyOCR パラメータ抽出", layout="wide")
-st.title("透析シャント画像からパラメータ抽出（EasyOCR版）")
+def pil_to_cv(pil_image):
+    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
-uploaded_file = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
+def extract_number(text):
+    match = re.search(r"(\d+\.\d+)", text.replace(",", ""))
+    return float(match.group(1)) if match else None
 
-if uploaded_file is not None:
-    pil_img = Image.open(uploaded_file).convert("RGB")
-    st.image(pil_img, caption="アップロード画像", use_container_width=True)
+def extract_parameters(img_pil):
+    img_cv = pil_to_cv(img_pil)
+    h, w = img_cv.shape[:2]
 
-    # NumPy配列に変換
-    img = np.array(pil_img)
-    h, w, _ = img.shape
+    # ROI (左上のラベル領域)
+    roi = img_cv[int(h*0.1):int(h*0.5), int(w*0.02):int(w*0.3)]
 
-    # 左上のラベルボックス相当のROIを切り出す（おおよその範囲）
-    x0, x1 = int(w * 0.02), int(w * 0.22)
-    y0, y1 = int(h * 0.18), int(h * 0.42)
-    roi = img[y0:y1, x0:x1]
+    # OCR実行
+    results = reader.readtext(roi)
 
-    st.subheader("ROI: ラベル領域（左上）")
-    st.image(roi, caption="推定ラベル領域", channels="RGB")
+    extracted = {}
+    for _, text, conf in results:
+        if conf < 0.4:
+            continue
+        text = text.strip()
+        if "PS" in text:
+            extracted["PSV"] = extract_number(text)
+        elif "ED" in text:
+            extracted["EDV"] = extract_number(text)
+        elif "TAMAX" in text:
+            extracted["TAMV"] = extract_number(text)
+        elif "TAMEAN" in text or "TAV" in text:
+            extracted["TAV"] = extract_number(text)
+        elif "RI" in text:
+            extracted["RI"] = extract_number(text)
+        elif "PI" in text:
+            extracted["PI"] = extract_number(text)
+        elif "FV" in text:
+            extracted["FV"] = extract_number(text)
+        elif "VF Diam" in text:
+            extracted["VF_Diam"] = extract_number(text)
+    return extracted
 
-    with st.spinner("OCR実行中..."):
-        results = reader.readtext(roi, detail=1)
+# ---------------- Streamlit UI ----------------
+st.title("EasyOCR: シャント機能数値抽出デモ")
 
-    # 表示用に文字と信頼度だけ抽出
-    raw_texts = [(text, conf) for (_, text, conf) in results if conf > 0.3]
+uploaded = st.file_uploader("画像をアップロードしてください（JPEG/PNG）", type=["jpg", "jpeg", "png"])
 
-    st.subheader("OCR生データ")
-    for text, conf in raw_texts:
-        st.write(f"[{conf:.2f}] {text}")
+if uploaded is not None:
+    img = Image.open(uploaded).convert("RGB")
+    st.image(img, caption="入力画像", use_column_width=True)
 
-    # 数値抽出ロジック
-    PARAM_KEYS = ["PS", "ED", "TAMAX", "TAMEAN", "PI", "RI", "FV", "VF Diam"]
-    param_dict = {}
+    with st.spinner("OCR中..."):
+        params = extract_parameters(img)
 
-    for text, conf in raw_texts:
-        for key in PARAM_KEYS:
-            if key.lower() in text.lower():
-                # 数値部分を抽出
-                match = re.search(r"(-?\d+(?:[.,]\d+)?)", text)
-                if match:
-                    val = float(match.group(1).replace(",", "."))
-                    param_dict[key] = val
-
-    st.subheader("抽出結果")
-    if param_dict:
-        st.json(param_dict)
+    if params:
+        st.success("以下のパラメータが抽出されました：")
+        st.json(params)
     else:
-        st.warning("有効なパラメータが検出できませんでした。")
+        st.warning("有効なパラメータが抽出できませんでした。ROIを調整してください。")
