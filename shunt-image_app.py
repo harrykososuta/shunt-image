@@ -13,27 +13,29 @@ reader = easyocr.Reader(['en'])
 def pil_to_cv(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
-# 数値抽出
+# 数値抽出（小数点付き対応）
 def extract_number(text):
     match = re.search(r"(\d+\.\d+)", text.replace(",", ""))
     return float(match.group(1)) if match else None
 
-# パラメータ抽出（ゆるめのマッチング対応）
+# パラメータ抽出（改良版：ラベル行と数値行のペア処理）
 def extract_parameters(img_pil):
     img_cv = pil_to_cv(img_pil)
     h, w = img_cv.shape[:2]
 
-    # 画像の左上（ラベル表示部）を切り出し
+    # 画面左上をROIに設定
     roi = img_cv[int(h*0.1):int(h*0.5), int(w*0.02):int(w*0.3)]
-
     results = reader.readtext(roi)
 
-    # 各パラメータに対応する複数表現
+    # 文字列と信頼度のみ抽出して前処理
+    lines = [(text.strip(), conf) for _, text, conf in results if conf > 0.4]
+
+    # キーワード定義（ゆるめ対応）
     keywords = {
-        "PSV": ["PS", "P5", "P5V", "PSV"],
-        "EDV": ["ED", "EDV", "EQ"],
+        "PSV": ["PS", "P5", "PSV"],
+        "EDV": ["ED", "EDV"],
         "TAMV": ["TAMAX", "TA MAX"],
-        "TAV": ["TAMEAN", "TA MEAN", "TAV"],
+        "TAV": ["TAMEAN", "TAV"],
         "PI": ["PI"],
         "RI": ["RI"],
         "FV": ["FV"],
@@ -41,14 +43,17 @@ def extract_parameters(img_pil):
     }
 
     extracted = {}
-    for _, text, conf in results:
-        if conf < 0.4:
-            continue  # 信頼度が低すぎるものはスキップ
+    i = 0
+    while i < len(lines) - 1:
+        label, _ = lines[i]
+        value_line, _ = lines[i + 1]
         for key, variations in keywords.items():
-            if any(kw.lower() in text.lower() for kw in variations):
-                val = extract_number(text)
-                if val is not None:
-                    extracted[key] = val
+            if any(kw.lower() in label.lower() for kw in variations):
+                value = extract_number(value_line)
+                if value is not None:
+                    extracted[key] = value
+        i += 1
+
     return extracted, results
 
 # ---------------- Streamlit UI ----------------
