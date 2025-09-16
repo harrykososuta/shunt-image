@@ -1,10 +1,11 @@
 # app.py
 # -------------------------------------------------------------
-# 透析シャント機能評価「画像読込＋判読サポート」v0.2.1
+# 透析シャント機能評価「画像読込＋判読サポート」v0.3 (GE優先)
 # 変更点:
-#  - Tesseract の実体バイナリを自動検出（Streamlit Cloud / ローカル両対応）
-#  - 未インストール時はOCRをスキップし、丁寧にガイダンス表示
-#  - それ以外は v0.2 と同じ（配置に依存しない全画面OCR→ラベル正規化）
+#  - メーカー別のOCR ROIを追加（GE/コニカミノルタ=左半分）
+#  - 画像全体→ROI抽出→OCR→GE表記の標準化
+#  - use_container_width に更新
+#  - Tesseract未インストール時はフォールバック表示
 # 実行: streamlit run app.py
 # -------------------------------------------------------------
 
@@ -16,16 +17,14 @@ import re
 import math
 import shutil
 
-# --- OCR backend (pytesseract) 準備 ---
+# ---- OCR backend（pytesseract）の存在チェック ----
 OCR_AVAILABLE = True
 try:
     import pytesseract
-    # Streamlit Cloud 等でバイナリの場所を自動検出
     _tess = shutil.which("tesseract")
     if _tess:
         pytesseract.pytesseract.tesseract_cmd = _tess
     else:
-        # バイナリが見つからない場合はOCR使用不可として扱う
         OCR_AVAILABLE = False
 except Exception:
     OCR_AVAILABLE = False
@@ -34,8 +33,8 @@ st.set_page_config(page_title="シャント機能評価 画像判読サポート
 
 # =============== 定数/初期設定 ===============
 MAKERS = [
-    "GE", "FUJIFILM", "CANON", "日立アロカ",
-    "コニカミノルタ", "PHILIPS", "SAMSUNG", "Siemens",
+    "GE", "コニカミノルタ", "FUJIFILM", "CANON",
+    "日立アロカ", "PHILIPS", "SAMSUNG", "Siemens",
 ]
 
 # 表示ゆれ ⇔ 標準ラベル
@@ -50,6 +49,7 @@ ALIASES = {
         "PI": ["PI", "PulsatilityIndex"],
         "VF_Diam": ["VF Diam", "VFDiam", "VF_Diam", "直径", "Diameter"],
     },
+    # GEは厳密化
     "GE": {
         "PSV": ["PS", "PSV"],
         "EDV": ["ED", "EDV"],
@@ -60,6 +60,24 @@ ALIASES = {
         "PI": ["PI"],
         "VF_Diam": ["VF Diam", "VFDiam"],
     },
+    # コニカミノルタは暫定（実機に合わせて増強予定）
+    "コニカミノルタ": {
+        "PSV": ["PSV", "PS"],
+        "EDV": ["EDV", "ED"],
+        "TAMV": ["TAMV", "TAMAX", "Vm"],
+        "TAV": ["TAV", "MEAN"],
+        "FV": ["FV", "Flow"],
+        "RI": ["RI"],
+        "PI": ["PI"],
+        "VF_Diam": ["VF Diam", "Diameter"],
+    },
+}
+
+# メーカー別OCR ROI（割合指定）— 左半分: x=(0.0,0.5), 全面: x=(0.0,1.0)
+OCR_ROI = {
+    "GE":            {"x": (0.0, 0.5), "y": (0.0, 1.0)},  # 左半分
+    "コニカミノルタ": {"x": (0.0, 0.5), "y": (0.0, 1.0)},  # 左半分
+    "default":       {"x": (0.0, 1.0), "y": (0.0, 1.0)},  # 施設差対応のため全面
 }
 
 THRESH = {
@@ -80,25 +98,35 @@ WAVE_DESCRIPTIONS = {
     "V":  "ほぼ等流・平坦化。心周期依存性が乏しく、常時高流指向。",
 }
 
-# =============== OCR（位置依存しない抽出） ===============
-def _preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
-    img = np.array(pil_img.convert("RGB"))[:, :, ::-1]  # BGR
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+# =============== OCRユーティリティ（メーカーROI対応） ===============
+def _crop_by_maker_roi(pil_img: Image.Image, maker: str) -> np.ndarray:
+    """メーカー別のROI（割合）で切り出し、RGB ndarray を返す"""
+    img = np.array(pil_img.convert("RGB"))
+    h, w, _ = img.shape
+    cfg = OCR_ROI.get(maker, OCR_ROI["default"])
+    x0, x1 = int(w * cfg["x"][0]), int(w * cfg["x"][1])
+    y0, y1 = int(h * cfg["y"][0]), int(h * cfg["y"][1])
+    roi = img[y0:y1, x0:x1]
+    return roi
+
+def _ocr_lines_anywhere(pil_img: Image.Image, maker: str):
+    """ROI抽出→前処理→pytesseractで行テキストへ"""
+    roi = _crop_by_maker_roi(pil_img, maker)
+
+    # 前処理: グレースケール→CLAHE→適応二値化
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     eq = clahe.apply(gray)
     th = cv2.adaptiveThreshold(eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                cv2.THRESH_BINARY, 31, 15)
-    return th
 
-def _ocr_lines_anywhere(pil_img: Image.Image):
-    th = _preprocess_for_ocr(pil_img)
     data = pytesseract.image_to_data(
         th, lang="eng", output_type=pytesseract.Output.DICT,
         config="--oem 3 --psm 6"
     )
+    # 単語→行に復元
     words = []
-    n = len(data["text"])
-    for i in range(n):
+    for i in range(len(data["text"])):
         txt = (data["text"][i] or "").strip()
         if not txt:
             continue
@@ -128,30 +156,24 @@ def _maker_patterns(maker: str):
 _VALUE = r"(-?\d+(?:\.\d+)?)"
 
 def extract_params_anywhere(pil_img: Image.Image, maker: str):
-    """画像全体から、メーカー表記ゆれを標準キーに正規化して抽出。"""
+    """メーカー別ROIでOCRし、標準キーに正規化した結果を返す"""
     if not OCR_AVAILABLE:
-        # OCRなし運用（手入力のみ）でもアプリが落ちないようにする
-        return {
-            "PSV": None, "EDV": None, "TAV": None, "TAMV": None,
-            "PI": None, "RI": None, "FV": None, "VF_Diam": None
-        }, []
-    lines = _ocr_lines_anywhere(pil_img)
+        return {k: None for k in ["PSV","EDV","TAV","TAMV","PI","RI","FV","VF_Diam"]}, []
+    lines = _ocr_lines_anywhere(pil_img, maker)
     pats = _maker_patterns(maker)
-    results = {
-        "PSV": None, "EDV": None, "TAV": None, "TAMV": None,
-        "PI": None, "RI": None, "FV": None, "VF_Diam": None
-    }
+    out = {k: None for k in ["PSV","EDV","TAV","TAMV","PI","RI","FV","VF_Diam"]}
+
     for ln in lines:
-        for std_key, alias_list in pats.items():
-            for alias in alias_list:
+        for std_key, aliases in pats.items():
+            for alias in aliases:
                 m = re.search(alias + r"\s*[:=]?\s*" + _VALUE + r"(?:\s*(cm/s|ml/min|cm))?",
                               ln, re.IGNORECASE)
-                if m and results.get(std_key) is None:
+                if m and out.get(std_key) is None:
                     try:
-                        results[std_key] = float(m.group(1))
-                    except Exception:
+                        out[std_key] = float(m.group(1))
+                    except:
                         pass
-    return results, lines
+    return out, lines
 
 # =============== 計算ユーティリティ ===============
 def normalize_labels(maker: str, input_dict: dict) -> dict:
@@ -173,13 +195,9 @@ def calc_metrics(std: dict) -> dict:
     PI  = std.get("PI")
 
     TAVR = RIPI = SDratio = None
-
-    if TAV is not None and TAMV not in (None, 0):
-        TAVR = TAV / TAMV
-    if RI is not None and PI not in (None, 0):
-        RIPI = RI / PI
-    if PSV not in (None, 0) and EDV is not None:
-        SDratio = PSV / max(EDV, 1e-9)
+    if TAV is not None and TAMV not in (None, 0): TAVR = TAV / TAMV
+    if RI is not None and PI not in (None, 0):    RIPI = RI / PI
+    if PSV not in (None, 0) and EDV is not None:  SDratio = PSV / max(EDV, 1e-9)
 
     if RI is None and PSV not in (None, 0):
         RI = (PSV - (EDV if EDV is not None else 0.0)) / PSV
@@ -195,31 +213,16 @@ def reynolds_number(mean_velocity_m_per_s, vessel_diameter_mm, rho=1060.0, mu=0.
     D = vessel_diameter_mm / 1000.0
     return (rho * mean_velocity_m_per_s * D) / mu
 
-def suggest_wave_type(ri, pi):
-    if ri is None or pi is None:
-        return None
-    if ri >= 0.8:      return "I"
-    if 0.7 <= ri < 0.8:return "II"
-    if 0.6 <= ri < 0.7:return "III"
-    if 0.5 <= ri < 0.6:return "IV"
-    return "V"
-
 def highlight(val, key):
     if val is None:
         return "—"
     abnormal = False
-    if key == "FV" and val is not None:
-        abnormal = val < THRESH["FV_low"]
-    if key == "RI" and val is not None:
-        abnormal = val > THRESH["RI_high"]
-    if key == "PI" and val is not None:
-        abnormal = val > THRESH["PI_high"]
-    if key == "TAVR" and val is not None:
-        abnormal = (val < THRESH["TAVR_low"]) or (val > THRESH["TAVR_high"])
-    if key == "SDratio" and val is not None:
-        abnormal = val > THRESH["SDratio_high"]
-    if key == "Re" and val is not None:
-        abnormal = val > THRESH["Re_high"]
+    if key == "FV" and val is not None:       abnormal = val < THRESH["FV_low"]
+    if key == "RI" and val is not None:       abnormal = val > THRESH["RI_high"]
+    if key == "PI" and val is not None:       abnormal = val > THRESH["PI_high"]
+    if key == "TAVR" and val is not None:     abnormal = (val < THRESH["TAVR_low"]) or (val > THRESH["TAVR_high"])
+    if key == "SDratio" and val is not None:  abnormal = val > THRESH["SDratio_high"]
+    if key == "Re" and val is not None:       abnormal = val > THRESH["Re_high"]
     style = "color: red; font-weight: 700;" if abnormal else ""
     txt = f"{val:.3f}" if isinstance(val, float) else f"{val}"
     return f"<span style='{style}'>{txt}</span>"
@@ -227,7 +230,7 @@ def highlight(val, key):
 # =============== サイドバー ===============
 st.sidebar.header("設定")
 maker = st.sidebar.selectbox("メーカーを選択", MAKERS, index=0)
-st.sidebar.caption("選択メーカーに応じてOCRラベル正規化を行います。")
+st.sidebar.caption("メーカー別にOCRの切り出し領域(ROI)を自動切替します。")
 
 st.sidebar.subheader("血液物性 / 血管径")
 rho = st.sidebar.number_input("血液密度 ρ [kg/m³]", value=1060.0, step=10.0, min_value=900.0, max_value=1200.0)
@@ -244,27 +247,26 @@ THRESH["SDratio_high"] = st.sidebar.number_input("SDratio 高値", value=float(T
 THRESH["Re_high"]      = st.sidebar.number_input("Reynolds 数 乱流目安", value=float(THRESH["Re_high"]), step=50.0)
 
 # =============== メイン ===============
-st.header("シャント機能評価：画像読込 & 自動解析（v0.2.1）")
+st.header("シャント機能評価：画像読込 & 自動解析（v0.3 / GE対応）")
 
 col1, col2 = st.columns([1.2, 1])
 with col1:
     uploaded = st.file_uploader("画像をアップロード（JPEG/PNG）", type=["jpg", "jpeg", "png"])
     if not OCR_AVAILABLE:
-        st.warning("OCRモジュール（Tesseract）が未インストールのため、画像からの自動抽出は無効です。"
-                   "Streamlit Cloud の場合はリポジトリ直下に packages.txt を追加し、"
+        st.warning("OCR(Tesseract)が未インストールのため自動抽出が無効です。"
+                   "Streamlit Cloudではリポジトリ直下の packages.txt に "
                    "`tesseract-ocr` と `tesseract-ocr-eng` を記載してください。")
 
     pil_img = None
     ocr_std = None
-    ocr_lines_dbg = None
 
     if uploaded is not None:
         pil_img = Image.open(uploaded).convert("RGB")
-        st.image(pil_img, caption="入力画像プレビュー", use_column_width=True)
+        st.image(pil_img, caption="入力画像プレビュー", use_container_width=True)
 
         if OCR_AVAILABLE:
-            with st.spinner("OCR抽出中..."):
-                ocr_std, ocr_lines_dbg = extract_params_anywhere(pil_img, maker)
+            with st.spinner(f"OCR抽出中...（ROI: {OCR_ROI.get(maker, OCR_ROI['default'])} ）"):
+                ocr_std, _ = extract_params_anywhere(pil_img, maker)
             if any(v is not None for v in ocr_std.values()):
                 st.success("OCR抽出（標準キー）")
                 st.json(ocr_std)
@@ -324,17 +326,15 @@ for i, k in enumerate(["RIPI","SDratio"]):
 st.markdown(f"**Re（Reynolds数）**: {highlight(Re, 'Re')}", unsafe_allow_html=True)
 
 # =============== 波形タイプ（I〜V） ===============
-st.subheader("上腕動脈血流波形タイプ（I〜V）")
-def suggest_wave_type_local(ri, pi):
-    if ri is None or pi is None:
-        return None
+def suggest_wave_type(ri, pi):
+    if ri is None or pi is None: return None
     if ri >= 0.8:      return "I"
     if 0.7 <= ri < 0.8:return "II"
     if 0.6 <= ri < 0.7:return "III"
     if 0.5 <= ri < 0.6:return "IV"
     return "V"
 
-suggested = suggest_wave_type_local(derived.get("RI"), derived.get("PI"))
+suggested = suggest_wave_type(derived.get("RI"), derived.get("PI"))
 colw1, colw2 = st.columns([1,2])
 with colw1:
     wave_type = st.selectbox(
