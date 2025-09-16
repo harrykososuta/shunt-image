@@ -6,31 +6,31 @@ from PIL import Image
 import cv2
 import re
 
-# OCRモデル初期化
+# OCRモデルの初期化（英語のみ）
 reader = easyocr.Reader(['en'])
 
-# PIL → OpenCV変換
+# PIL → OpenCV 変換
 def pil_to_cv(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
-# 数値抽出（小数点付き対応）
+# 数値抽出（小数点対応）
 def extract_number(text):
     match = re.search(r"(\d+\.\d+)", text.replace(",", ""))
     return float(match.group(1)) if match else None
 
-# パラメータ抽出（改良版：ラベル行と数値行のペア処理）
+# パラメータ抽出（1行 or 2行に分かれたケース両対応）
 def extract_parameters(img_pil):
     img_cv = pil_to_cv(img_pil)
     h, w = img_cv.shape[:2]
 
-    # 画面左上をROIに設定
-    roi = img_cv[int(h*0.1):int(h*0.5), int(w*0.02):int(w*0.3)]
+    # パラメータがある左上の範囲を抽出
+    roi = img_cv[int(h * 0.1):int(h * 0.5), int(w * 0.02):int(w * 0.3)]
     results = reader.readtext(roi)
 
-    # 文字列と信頼度のみ抽出して前処理
+    # 読み取り結果を整形
     lines = [(text.strip(), conf) for _, text, conf in results if conf > 0.4]
 
-    # キーワード定義（ゆるめ対応）
+    # 各パラメータのキーワード（曖昧対応）
     keywords = {
         "PSV": ["PS", "P5", "PSV"],
         "EDV": ["ED", "EDV"],
@@ -43,8 +43,23 @@ def extract_parameters(img_pil):
     }
 
     extracted = {}
+    used_indices = set()
+
+    # --- 1行内にラベル＋数値があるパターン ---
+    for idx, (text, conf) in enumerate(lines):
+        for key, variations in keywords.items():
+            if any(kw.lower() in text.lower() for kw in variations):
+                value = extract_number(text)
+                if value is not None:
+                    extracted[key] = value
+                    used_indices.add(idx)
+
+    # --- 2行にラベルと数値が分かれているパターン ---
     i = 0
     while i < len(lines) - 1:
+        if i in used_indices or i + 1 in used_indices:
+            i += 1
+            continue
         label, _ = lines[i]
         value_line, _ = lines[i + 1]
         for key, variations in keywords.items():
@@ -52,30 +67,30 @@ def extract_parameters(img_pil):
                 value = extract_number(value_line)
                 if value is not None:
                     extracted[key] = value
+                    used_indices.update([i, i + 1])
         i += 1
 
     return extracted, results
 
 # ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="シャント画像OCR", layout="centered")
-st.title("🩸 シャント画像から数値を自動抽出（EasyOCR）")
+st.set_page_config(page_title="シャントOCR", layout="centered")
+st.title("🩺 シャント画像の数値自動抽出（EasyOCR）")
 
-uploaded = st.file_uploader("画像をアップロードしてください", type=["jpg", "jpeg", "png"])
+uploaded = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
 
 if uploaded:
     img = Image.open(uploaded).convert("RGB")
     st.image(img, caption="入力画像", use_container_width=True)
 
-    with st.spinner("OCRで解析中..."):
-        params, ocr_raw = extract_parameters(img)
+    with st.spinner("OCR解析中..."):
+        params, raw = extract_parameters(img)
 
     st.subheader("📊 抽出されたパラメータ")
     if params:
         st.json(params)
     else:
-        st.warning("パラメータが検出できませんでした。画像の解像度や切り出し範囲をご確認ください。")
+        st.warning("パラメータが見つかりませんでした")
 
-    # デバッグ用のOCRテキスト表示
-    with st.expander("🔍 OCRの生出力（デバッグ用）"):
-        for _, text, conf in ocr_raw:
+    with st.expander("🔍 OCRの生データ（デバッグ用）"):
+        for _, text, conf in raw:
             st.write(f"[{conf:.2f}] {text}")
