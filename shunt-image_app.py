@@ -83,21 +83,6 @@ def extract_parameters(img_pil, manufacturer):
 
     return extracted, results
 
-def classify_waveform(psv, edv, pi, fv):
-    if edv < 5 and fv < 500:
-        return "Type V", "閉塞型（V型）：EDVほぼゼロ、流量非常に低い"
-    elif fv > 1500:
-        return "Type I", "高流量型（I型）：FVが1500以上で過大血流が示唆される"
-    elif pi > 1.3 and edv < 40:
-        return "Type III", "吻合部狭窄型（III型）：PIが高く、EDVが低下"
-    elif pi < 1.3 and edv < 40:
-        return "Type II", "中等度狭窄型（II型）：PI正常でもEDVが低下"
-    elif pi > 1.3 and edv >= 40:
-        return "Type IV", "末梢狭窄型（IV型）：PI高値、EDV保たれている"
-    elif edv >= 40 and pi < 1.3:
-        return "Type II", "中等度狭窄型（II型）：EDV保たれPI正常 → 軽度狭窄の可能性"
-    else:
-        return "判定不能", "波形分類の基準を満たしません。再評価してください"
 
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="シャントOCR", layout="centered")
@@ -124,8 +109,9 @@ if uploaded:
     else:
         st.warning("パラメータが見つかりませんでした")
 
-    # ----- 自動評価スコア -----
+    # ----- 自動評価セクション -----
     st.subheader("🔍 自動評価スコア")
+
     form = {k.lower(): v for k, v in params.items()}
     score = 0
     comments = []
@@ -154,7 +140,10 @@ if uploaded:
     if comments:
         st.write("### 評価コメント")
         for level, comment in comments:
-            st.warning(f"- {comment}")
+            if level == "warning":
+                st.warning(f"- {comment}")
+            else:
+                st.write(f"- {comment}")
 
     # ----- AI診断コメント -----
     tav = form.get("tav", 0)
@@ -163,7 +152,6 @@ if uploaded:
     pi = form.get("pi", 0.1)
     fv = form.get("fv", 0)
     edv = form.get("edv", 0)
-    psv = form.get("psv", 0)
 
     TAVR = tav / tamv if tamv else 0
     RI_PI = ri / pi if pi else 0
@@ -208,13 +196,34 @@ if uploaded:
                     for sup in ai_supplement:
                         st.write(f"- {sup}")
 
-    # ----- 波形分類結果表示 -----
+    # ----- 波形分類セクション -----
     st.subheader("📈 波形分類結果")
+
+    def classify_waveform(params):
+        try:
+            psv = params.get("psv", 0)
+            edv = params.get("edv", 0)
+            pi = params.get("pi", 0)
+            fv = params.get("fv", 0)
+
+            if edv == 0 and fv < 100:
+                return "Type V", "閉塞型（V型）：EDVほぼゼロ・流量非常に低"
+            elif pi >= 1.3 and edv < 40.4:
+                return "Type IV", "末梢狭窄型（IV型）：PI高値・EDV低下 → 末梢抵抗上昇"
+            elif pi >= 1.3 and edv >= 40.4:
+                return "Type III", "吻合部狭窄型（III型）：PI高値・切痕様波形 → 狭窄傾向"
+            elif fv > 1500:
+                return "Type I", "過大血流型（I型）：FVが1500ml/min以上"
+            elif fv < 500 and edv < 40.4:
+                return "Type IV", "末梢狭窄型（IV型）：FVやや低下・EDVも低下"
+            else:
+                return "Type II", "正常型（II型）：PSV/EDV良好・FV正常範囲"
+
+        except Exception:
+            return "判定不能", "説明: 必要なパラメータが欠損しているため分類できません"
+
+    waveform_type, waveform_comment = classify_waveform(form)
+
     with st.expander("📊 波形分類と説明（クリックで展開）"):
-        if all([psv, edv, pi, fv]):
-            wf_type, wf_comment = classify_waveform(psv, edv, pi, fv)
-            st.markdown(f"**波形分類**: {wf_type}")
-            st.caption(f"説明: {wf_comment}")
-        else:
-            st.markdown("**波形分類**: 判定不能")
-            st.caption("説明: 必要なパラメータが欠損しているため分類できません")
+        st.markdown(f"**波形分類: {waveform_type}**")
+        st.caption(f"説明: {waveform_comment}")
