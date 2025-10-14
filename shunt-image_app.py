@@ -5,16 +5,19 @@ from PIL import Image
 import cv2
 import re
 
-# OCRモデルの初期化（英語のみ）
+# OCRモデル
 reader = easyocr.Reader(['en'])
 
+# PIL → OpenCV変換
 def pil_to_cv(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
+# 数値抽出
 def extract_number(text):
     match = re.search(r"(\d+\.\d+)", text.replace(",", ""))
     return float(match.group(1)) if match else None
 
+# メーカー別キーワード設定
 KEYWORDS_BY_MANUFACTURER = {
     "GEヘルスケア": {
         "PSV": ["PS", "P5", "PSV"],
@@ -48,18 +51,18 @@ KEYWORDS_BY_MANUFACTURER = {
     }
 }
 
+# パラメータ抽出
 def extract_parameters(img_pil, manufacturer):
     img_cv = pil_to_cv(img_pil)
     h, w = img_cv.shape[:2]
     roi = img_cv[int(h * 0.1):int(h * 0.5), int(w * 0.02):int(w * 0.3)]
     results = reader.readtext(roi)
-
     lines = [(text.strip(), conf) for _, text, conf in results if conf > 0.4]
     keywords = KEYWORDS_BY_MANUFACTURER[manufacturer]
     extracted = {}
     used_indices = set()
 
-    # 1行ラベル＋数値パターン
+    # 同一行処理
     for idx, (text, conf) in enumerate(lines):
         for key, variations in keywords.items():
             if any(kw.lower() in text.lower() for kw in variations):
@@ -68,7 +71,7 @@ def extract_parameters(img_pil, manufacturer):
                     extracted[key] = value
                     used_indices.add(idx)
 
-    # 2行分割パターン
+    # 2行対応
     i = 0
     while i < len(lines) - 1:
         if i in used_indices or i + 1 in used_indices:
@@ -86,118 +89,25 @@ def extract_parameters(img_pil, manufacturer):
 
     return extracted, results
 
-def waveform_classification(params, evaluation_result):
-    """
-    params: dict with keys "psv","edv","pi","ri","fv" (lowercase)
-    evaluation_result: dict or tuple indicating whether VAIVT is recommended etc.
-    Returns: (wave_type_str, explanation_str)
-    """
-    psv = params.get("psv", 0)
-    edv = params.get("edv", 0)
-    pi = params.get("pi", 0)
-    ri = params.get("ri", 0)
-    fv = params.get("fv", 0)
-    # 比率安全ガード
-    ratio = edv / psv if psv else 0
 
-    # 評価結果との矛盾チェック用フラグ
-    # 例：evaluation_result["vaivt_needed"] が True の場合、Ⅱ型はおかしいなど
-    vaivt_needed = evaluation_result.get("vaivt_needed", False)
-
-    # 基本分類ロジック
-    # Ⅰ → 過大血流
-    if fv >= 1500:
-        wave = "Type I"
-        expl = "過大血流型：FVが1500以上"
-    else:
-        # Ⅱ型の候補条件
-        cond_ii = (ratio > 0.4 and pi < 1.3 and not vaivt_needed)
-        # Ⅲ型条件：切痕傾向 + PI 高値 + EDV比低
-        cond_iii = (ratio < 0.4 and pi >= 1.3)
-        # Ⅳ型条件：EDV より著しく低下 + PI 高 + 切痕明瞭
-        cond_iv = (edv < 30 and pi >= 1.3)
-        # Ⅴ型条件：EDV ≈ 0 に近く、流量非常に低い
-        cond_v = (edv < 5 or fv < 50)
-
-        if cond_ii:
-            wave = "Type II"
-            expl = "良好波形型（Ⅱ型）：EDV比高く、PIも正常域"
-        elif cond_iii:
-            wave = "Type III"
-            expl = "中等度狭窄型（Ⅲ型）：PIがやや上昇、EDV低め"
-        elif cond_iv:
-            wave = "Type IV"
-            expl = "高度狭窄型（Ⅳ型）：EDVが著しく低く、PI高"
-        elif cond_v:
-            wave = "Type V"
-            expl = "閉塞型（Ⅴ型）：EDVほぼゼロ・流量非常に低"
-        else:
-            wave = "Uncertain / 混合型"
-            expl = "分類しきれないグレーゾーン"
-
-    # もし VAIVT 要の評価と分類が矛盾するなら警告
-    if vaivt_needed and wave in ("Type I", "Type II"):
-        expl += "（⚠ VAIVT 提案と矛盾する分類）"
-
-    return wave, expl
-
-def evaluate_params(params):
-    """
-    あなたの既存の評価コードをここに統合して
-    vaivt_needed: True/False などを出すようにする
-    """
-    # 小文字キーに変換
-    f = {k.lower(): v for k, v in params.items()}
-    score = 0
-    comments = []
-    vaivt_needed = False
-
-    if f.get("tav", 0) <= 34.5:
-        score += 1
-        comments.append(("warning", "TAV が 34.5 cm/s 以下 → 低血流が疑われる"))
-    if f.get("ri", 0) >= 0.68:
-        score += 1
-        comments.append(("warning", "RI が 0.68 以上 → 高抵抗が疑われる"))
-    if f.get("pi", 0) >= 1.3:
-        score += 1
-        comments.append(("warning", "PI が 1.3 以上 → 脈波指数が高い"))
-    if f.get("edv", 999) <= 40.4:
-        score += 1
-        comments.append(("warning", "EDV が 40.4 cm/s 以下 → 拡張期血流速度が低い"))
-
-    if score >= 3:
-        vaivt_needed = True
-
-    # AI 診断コメントも…（省略。前述のものをそのまま使えば良い）
-    ai_main = ""
-    # …（AIロジックをここに入れる）…
-
-    return {
-        "score": score,
-        "comments": comments,
-        "vaivt_needed": vaivt_needed,
-        "ai_main": ai_main
-    }
-
-# ------------------- Streamlit UI -------------------
-st.set_page_config(page_title="シャント OCR + 波形分類", layout="centered")
-st.title("🩺 シャント波形分類付き数値抽出アプリ")
+# ---------------- Streamlit UI ----------------
+st.set_page_config(page_title="シャントOCR", layout="centered")
+st.title("🩺 シャント画像の数値自動抽出＆診断")
 
 st.sidebar.title("⚙️ メーカー設定")
 manufacturer = st.sidebar.selectbox(
-    "画像のメーカーを選択",
+    "画像のメーカーを選択してください",
     ["GEヘルスケア", "FUJIFILM", "コミカミノルタ"]
 )
 
 uploaded = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
+
 if uploaded:
     img = Image.open(uploaded).convert("RGB")
     st.image(img, caption="入力画像", use_container_width=True)
 
-    with st.spinner("OCR + 波形分類中..."):
+    with st.spinner("OCR解析中..."):
         params, raw = extract_parameters(img, manufacturer)
-        evaluation = evaluate_params(params)
-        wave_type, wave_expl = waveform_classification(params, evaluation)
 
     st.subheader("📊 抽出されたパラメータ")
     if params:
@@ -205,27 +115,109 @@ if uploaded:
     else:
         st.warning("パラメータが見つかりませんでした")
 
+    # ----- 自動評価セクション -----
     st.subheader("🔍 自動評価スコア")
-    st.write(f"評価スコア: {evaluation['score']} / 4")
-    if evaluation["score"] == 0:
+
+    form = {k.lower(): v for k, v in params.items()}
+    score = 0
+    comments = []
+
+    if form.get("tav", 999) <= 34.5:
+        score += 1
+        comments.append(("warning", "TAVが34.5 cm/s以下 → 低血流が疑われる"))
+    if form.get("ri", 0) >= 0.68:
+        score += 1
+        comments.append(("warning", "RIが0.68以上 → 高抵抗が疑われる"))
+    if form.get("pi", 0) >= 1.3:
+        score += 1
+        comments.append(("warning", "PIが1.3以上 → 脈波指数が高い"))
+    if form.get("edv", 999) <= 40.4:
+        score += 1
+        comments.append(("warning", "EDVが40.4 cm/s以下 → 拡張期血流速度が低い"))
+
+    st.write(f"評価スコア: {score} / 4")
+    if score == 0:
         st.success("🟢 正常：経過観察が推奨されます")
-    elif evaluation["score"] in [1, 2]:
+    elif score in [1, 2]:
         st.warning("🟡 要注意：追加評価が必要です")
     else:
         st.error("🔴 高リスク：専門的な評価が必要です")
 
-    if evaluation["comments"]:
+    if comments:
         st.write("### 評価コメント")
-        for level, comment in evaluation["comments"]:
-            if level == "warning":
-                st.warning(f"- {comment}")
-            else:
-                st.write(f"- {comment}")
+        for level, comment in comments:
+            st.warning(f"- {comment}")
 
-    with st.expander("📈 波形分類結果と解説"):
-        st.write(f"**波形分類:** {wave_type}")
-        st.write(f"**解説:** {wave_expl}")
+    # ----- AI診断コメント -----
+    tav = form.get("tav", 0)
+    tamv = form.get("tamv", 1)
+    ri = form.get("ri", 0)
+    pi = form.get("pi", 0.1)
+    fv = form.get("fv", 0)
+    edv = form.get("edv", 0)
+    psv = form.get("psv", 0)
 
-    with st.expander("🔍 OCR の生データ（デバッグ用）"):
-        for _, text, conf in raw:
-            st.write(f"[{conf:.2f}] {text}")
+    TAVR = tav / tamv if tamv else 0
+    RI_PI = ri / pi if pi else 0
+
+    with st.container(border=True):
+        with st.expander("🤖 AIによる診断コメントを表示 / 非表示"):
+            if st.button("AI診断を実行"):
+                ai_main_comment = ""
+                ai_supplement = []
+
+                if tav < 34.5 and edv < 40.4 and ri >= 0.68 and pi >= 1.3:
+                    ai_main_comment = "TAVとEDVの低下。RIとPIの上昇。早急なVAIVT提案が必要です。急な閉塞の危険性があります。"
+                elif tav < 34.5 and pi >= 1.3 and edv < 40.4:
+                    ai_main_comment = "TAVおよびEDVの低下に加え、PIが上昇。吻合部近傍の高度狭窄が強く疑われます。VAIVT提案を検討してください"
+                elif tav < 34.5 and pi >= 1.3:
+                    ai_main_comment = "TAVの低下に加え、PIが上昇。吻合部近傍の高度狭窄が疑われます"
+                elif tav < 34.5 and edv < 40.4 and pi < 1.3:
+                    ai_main_comment = "TAVとEDVが低下しており、中等度の吻合部狭窄が疑われます"
+                elif tav < 34.5 and edv >= 40.4:
+                    ai_main_comment = "TAVが低下しており、軽度の吻合部狭窄の可能性があります"
+                elif ri >= 0.68 and edv < 40.4:
+                    ai_main_comment = "RIが高く、EDVが低下。末梢側の狭窄が疑われます"
+                elif ri >= 0.68:
+                    ai_main_comment = "RIが上昇しています。末梢抵抗の増加が示唆されますが、他のパラメータ異常がないため再検が必要です"
+                elif fv < 500:
+                    ai_main_comment = "血流量がやや低下しています。経過観察が望まれますが、他のパラメータ異常がないため再検が必要です"
+                elif score == 0:
+                    ai_main_comment = "正常だと思います。経過観察お願いします"
+                else:
+                    ai_main_comment = "特記すべき高度な異常所見は検出されませんでしたが、一部パラメータに変化が見られます"
+
+                if tav < 25 and 500 <= fv <= 1000:
+                    ai_supplement.append("TAVが非常に低く、FVは正常範囲 → 上腕動脈径が大きいため、過大評価の可能性があります")
+                if fv > 1500:
+                    ai_supplement.append("FVが高値です。large shuntの可能性があります。身体症状の確認が必要です。")
+                if ri >= 0.68 and pi >= 1.3 and fv >= 400 and tav >= 50:
+                    ai_supplement.append("RI・PIが上昇していますが、FV・TAVは正常値です。吻合部近傍の分岐血管が影響している可能性があります。遮断試験を実施してください。")
+
+                st.info(f"🧠 主コメント: {ai_main_comment}")
+                if ai_supplement:
+                    st.write("#### 💬 補足コメント")
+                    for sup in ai_supplement:
+                        st.write(f"- {sup}")
+
+    # ----- 波形分類判読 -----
+    def classify_waveform(psv, edv, pi, fv):
+        if fv >= 1500:
+            return "Type I", "過大血流型（Ⅰ型）：FVが1500以上"
+        elif edv < 5 or fv < 50:
+            return "Type V", "閉塞型（Ⅴ型）：EDVほぼゼロ、流量非常に低い"
+        elif edv < 30 and pi >= 1.3:
+            return "Type IV", "高度狭窄型（Ⅳ型）：EDVが著しく低くPI高値"
+        elif edv / psv < 0.4 and pi >= 1.3:
+            return "Type III", "中等度狭窄型（Ⅲ型）：PIが高くEDV比低下"
+        elif edv / psv >= 0.4 and pi < 1.3 and score <= 1:
+            return "Type II", "良好波形型（Ⅱ型）：EDV比高くPI正常"
+        else:
+            return "不明 / 混合型", "他分類に当てはまらないグレーゾーン波形"
+
+    waveform_type, waveform_explanation = classify_waveform(psv, edv, pi, fv)
+
+    st.subheader("📈 波形分類結果")
+    with st.expander("🧬 波形分類と説明（クリックで展開）", expanded=True):
+        st.markdown(f"**波形分類:** {waveform_type}")
+        st.caption(f"説明: {waveform_explanation}")
