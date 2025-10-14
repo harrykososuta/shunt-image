@@ -11,9 +11,10 @@ def pil_to_cv(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 def extract_number(text):
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
     matches = re.findall(r"\d+\.\d+", text.replace(",", ""))
     if matches:
-        # 複数候補があれば最大のものを返す
         return float(max(matches, key=lambda x: float(x)))
     return None
 
@@ -53,7 +54,6 @@ KEYWORDS_BY_MANUFACTURER = {
 def extract_parameters(img_pil, manufacturer):
     img_cv = pil_to_cv(img_pil)
     h, w = img_cv.shape[:2]
-    # ROI を左右と縦方向に拡張して数値が映る範囲を広げる
     roi = img_cv[int(h * 0.05):int(h * 0.6), int(w * 0.01):int(w * 0.5)]
     results = reader.readtext(roi)
 
@@ -62,7 +62,6 @@ def extract_parameters(img_pil, manufacturer):
     extracted = {}
     used_indices = set()
 
-    # --- 横方向パターン（同行にラベルと数値） ---
     for idx, (text, conf, bbox) in enumerate(lines):
         for key, variations in keywords.items():
             if any(kw.lower() in text.lower() for kw in variations):
@@ -71,14 +70,12 @@ def extract_parameters(img_pil, manufacturer):
                     extracted[key] = value
                     used_indices.add(idx)
 
-    # --- 縦方向補助パターン（ラベルのすぐ下の行に数値があることを仮定） ---
     for idx, (text, conf, bbox) in enumerate(lines):
         for key, variations in keywords.items():
             if any(kw.lower() in text.lower() for kw in variations):
-                # 下の行を探す
                 j = idx + 1
                 if j < len(lines) and j not in used_indices:
-                    _, val_text, _ = lines[j]
+                    val_text, _, _ = lines[j]
                     value = extract_number(val_text)
                     if value is not None:
                         extracted[key] = value
@@ -87,23 +84,22 @@ def extract_parameters(img_pil, manufacturer):
     return extracted, results
 
 def classify_waveform(psv, edv, pi, fv):
-    # 分類ルール（強化版）
     if edv < 5 and fv < 100:
         return "Type V", "閉塞型（Ⅴ型）：EDVほぼゼロ・流量非常に低い"
     elif fv > 1500:
         return "Type I", "過大血流型（Ⅰ型）：FVが1500以上"
     elif pi >= 1.3 and edv < 40.4:
-        # PI高 + EDV低：末梢抵抗 or 狭窄傾向強め
         return "Type IV", "末梢狭窄型（Ⅳ型）：PI高値、EDV低下傾向"
     elif pi >= 1.3:
-        # PI高でも EDVが保たれていたらⅢに近づける
         return "Type III", "中等度狭窄型（Ⅲ型）：PI高値＋切痕傾向"
     elif fv < 500 and edv < 40.4:
-        # 血流量低下 + 中等度低 EDV → 狭窄傾向（Type IV寄り）
         return "Type IV", "末梢狭窄型（Ⅳ型）：FV低下 × EDV低下"
     else:
-        # それ以外は II 型扱い
         return "Type II", "良好波形型（Ⅱ型）：EDV保たれ、PI正常域"
+
+# 以下略（UI部分は前回提示したものをそのまま）
+
+
 
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="シャントOCR", layout="centered")
@@ -221,3 +217,4 @@ if uploaded:
         wf_type, wf_comment = classify_waveform(psv, edv, pi, fv)
         st.markdown(f"**波形分類:** {wf_type}")
         st.caption(f"説明: {wf_comment}")
+
