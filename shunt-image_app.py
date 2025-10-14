@@ -11,8 +11,11 @@ def pil_to_cv(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 def extract_number(text):
-    match = re.search(r"(\d+\.\d+)", text.replace(",", ""))
-    return float(match.group(1)) if match else None
+    matches = re.findall(r"\d+\.\d+", text.replace(",", ""))
+    if matches:
+        # 複数候補があれば最大のものを返す
+        return float(max(matches, key=lambda x: float(x)))
+    return None
 
 KEYWORDS_BY_MANUFACTURER = {
     "GEヘルスケア": {
@@ -50,15 +53,17 @@ KEYWORDS_BY_MANUFACTURER = {
 def extract_parameters(img_pil, manufacturer):
     img_cv = pil_to_cv(img_pil)
     h, w = img_cv.shape[:2]
-    roi = img_cv[int(h * 0.1):int(h * 0.5), int(w * 0.02):int(w * 0.3)]
+    # ROI を左右と縦方向に拡張して数値が映る範囲を広げる
+    roi = img_cv[int(h * 0.05):int(h * 0.6), int(w * 0.01):int(w * 0.5)]
     results = reader.readtext(roi)
 
-    lines = [(text.strip(), conf) for _, text, conf in results if conf > 0.4]
+    lines = [(text.strip(), conf, bbox) for bbox, text, conf in results if conf > 0.4]
     keywords = KEYWORDS_BY_MANUFACTURER[manufacturer]
     extracted = {}
     used_indices = set()
 
-    for idx, (text, conf) in enumerate(lines):
+    # --- 横方向パターン（同行にラベルと数値） ---
+    for idx, (text, conf, bbox) in enumerate(lines):
         for key, variations in keywords.items():
             if any(kw.lower() in text.lower() for kw in variations):
                 value = extract_number(text)
@@ -66,23 +71,39 @@ def extract_parameters(img_pil, manufacturer):
                     extracted[key] = value
                     used_indices.add(idx)
 
-    i = 0
-    while i < len(lines) - 1:
-        if i in used_indices or i + 1 in used_indices:
-            i += 1
-            continue
-        label, _ = lines[i]
-        value_line, _ = lines[i + 1]
+    # --- 縦方向補助パターン（ラベルのすぐ下の行に数値があることを仮定） ---
+    for idx, (text, conf, bbox) in enumerate(lines):
         for key, variations in keywords.items():
-            if any(kw.lower() in label.lower() for kw in variations):
-                value = extract_number(value_line)
-                if value is not None:
-                    extracted[key] = value
-                    used_indices.update([i, i + 1])
-        i += 1
+            if any(kw.lower() in text.lower() for kw in variations):
+                # 下の行を探す
+                j = idx + 1
+                if j < len(lines) and j not in used_indices:
+                    _, val_text, _ = lines[j]
+                    value = extract_number(val_text)
+                    if value is not None:
+                        extracted[key] = value
+                        used_indices.add(j)
 
     return extracted, results
 
+def classify_waveform(psv, edv, pi, fv):
+    # 分類ルール（強化版）
+    if edv < 5 and fv < 100:
+        return "Type V", "閉塞型（Ⅴ型）：EDVほぼゼロ・流量非常に低い"
+    elif fv > 1500:
+        return "Type I", "過大血流型（Ⅰ型）：FVが1500以上"
+    elif pi >= 1.3 and edv < 40.4:
+        # PI高 + EDV低：末梢抵抗 or 狭窄傾向強め
+        return "Type IV", "末梢狭窄型（Ⅳ型）：PI高値、EDV低下傾向"
+    elif pi >= 1.3:
+        # PI高でも EDVが保たれていたらⅢに近づける
+        return "Type III", "中等度狭窄型（Ⅲ型）：PI高値＋切痕傾向"
+    elif fv < 500 and edv < 40.4:
+        # 血流量低下 + 中等度低 EDV → 狭窄傾向（Type IV寄り）
+        return "Type IV", "末梢狭窄型（Ⅳ型）：FV低下 × EDV低下"
+    else:
+        # それ以外は II 型扱い
+        return "Type II", "良好波形型（Ⅱ型）：EDV保たれ、PI正常域"
 
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="シャントOCR", layout="centered")
@@ -111,7 +132,6 @@ if uploaded:
 
     # ----- 自動評価セクション -----
     st.subheader("🔍 自動評価スコア")
-
     form = {k.lower(): v for k, v in params.items()}
     score = 0
     comments = []
@@ -152,6 +172,7 @@ if uploaded:
     pi = form.get("pi", 0.1)
     fv = form.get("fv", 0)
     edv = form.get("edv", 0)
+    psv = form.get("psv", 0)
 
     TAVR = tav / tamv if tamv else 0
     RI_PI = ri / pi if pi else 0
@@ -163,32 +184,30 @@ if uploaded:
                 ai_supplement = []
 
                 if tav < 34.5 and edv < 40.4 and ri >= 0.68 and pi >= 1.3:
-                    ai_main_comment = "TAVとEDVの低下。RIとPIの上昇。早急なVAIVT提案が必要です。急な閉塞の危険性があります。"
+                    ai_main_comment = "TAVとEDVの低下。RIとPIの上昇。早急なVAIVT提案が必要です。閉塞リスク高。"
                 elif tav < 34.5 and pi >= 1.3 and edv < 40.4:
-                    ai_main_comment = "TAVおよびEDVの低下に加え、PIが上昇。吻合部近傍の高度狭窄が強く疑われます。VAIVT提案を検討してください"
+                    ai_main_comment = "TAV低下＋EDV低下＋PI上昇。吻合部近傍の高度狭窄が疑われます。VAIVT検討を。"
                 elif tav < 34.5 and pi >= 1.3:
-                    ai_main_comment = "TAVの低下に加え、PIが上昇。吻合部近傍の高度狭窄が疑われます"
-                elif tav < 34.5 and edv < 40.4 and pi < 1.3:
-                    ai_main_comment = "TAVとEDVが低下しており、中等度の吻合部狭窄が疑われます"
+                    ai_main_comment = "TAV低下＋PI上昇。高度狭窄疑い。"
                 elif tav < 34.5 and edv >= 40.4:
-                    ai_main_comment = "TAVが低下しており、軽度の吻合部狭窄の可能性があります"
+                    ai_main_comment = "TAV低下あり。軽度狭窄可能性。"
                 elif ri >= 0.68 and edv < 40.4:
-                    ai_main_comment = "RIが高く、EDVが低下。末梢側の狭窄が疑われます"
+                    ai_main_comment = "RI高値＋EDV低下。末梢側狭窄疑い。"
                 elif ri >= 0.68:
-                    ai_main_comment = "RIが上昇しています。末梢抵抗の増加が示唆されますが、他のパラメータ異常がないため再検が必要です"
+                    ai_main_comment = "RI上昇。末梢抵抗増加の可能性。"
                 elif fv < 500:
-                    ai_main_comment = "血流量がやや低下しています。経過観察が望まれますが、他のパラメータ異常がないため再検が必要です"
+                    ai_main_comment = "血流量やや低下。追加評価検討。"
                 elif score == 0:
-                    ai_main_comment = "正常だと思います。経過観察お願いします"
+                    ai_main_comment = "正常値域。経過観察推奨。"
                 else:
-                    ai_main_comment = "特記すべき高度な異常所見は検出されませんでしたが、一部パラメータに変化が見られます"
+                    ai_main_comment = "明確な異常所見なし。ただし一部値に変化。"
 
                 if tav < 25 and 500 <= fv <= 1000:
-                    ai_supplement.append("TAVが非常に低く、FVは正常範囲 → 上腕動脈径が大きいため、過大評価の可能性があります")
+                    ai_supplement.append("TAV非常に低値、FV正常圏内 → 血管径の影響注意")
                 if fv > 1500:
-                    ai_supplement.append("FVが高値です。large shuntの可能性があります。身体症状の確認が必要です。")
+                    ai_supplement.append("FV高値：large shunt の可能性")
                 if ri >= 0.68 and pi >= 1.3 and fv >= 400 and tav >= 50:
-                    ai_supplement.append("RI・PIが上昇していますが、FV・TAVは正常値です。吻合部近傍の分岐血管が影響している可能性があります。遮断試験を実施してください。")
+                    ai_supplement.append("RI・PI高値だが FV/TAV 正常値 → 分岐血管影響可能")
 
                 st.info(f"🧠 主コメント: {ai_main_comment}")
                 if ai_supplement:
@@ -196,34 +215,9 @@ if uploaded:
                     for sup in ai_supplement:
                         st.write(f"- {sup}")
 
-    # ----- 波形分類セクション -----
+    # ----- 波形分類表示 -----
     st.subheader("📈 波形分類結果")
-
-    def classify_waveform(params):
-        try:
-            psv = params.get("psv", 0)
-            edv = params.get("edv", 0)
-            pi = params.get("pi", 0)
-            fv = params.get("fv", 0)
-
-            if edv == 0 and fv < 100:
-                return "Type V", "閉塞型（V型）：EDVほぼゼロ・流量非常に低"
-            elif pi >= 1.3 and edv < 40.4:
-                return "Type IV", "末梢狭窄型（IV型）：PI高値・EDV低下 → 末梢抵抗上昇"
-            elif pi >= 1.3 and edv >= 40.4:
-                return "Type III", "吻合部狭窄型（III型）：PI高値・切痕様波形 → 狭窄傾向"
-            elif fv > 1500:
-                return "Type I", "過大血流型（I型）：FVが1500ml/min以上"
-            elif fv < 500 and edv < 40.4:
-                return "Type IV", "末梢狭窄型（IV型）：FVやや低下・EDVも低下"
-            else:
-                return "Type II", "正常型（II型）：PSV/EDV良好・FV正常範囲"
-
-        except Exception:
-            return "判定不能", "説明: 必要なパラメータが欠損しているため分類できません"
-
-    waveform_type, waveform_comment = classify_waveform(form)
-
     with st.expander("📊 波形分類と説明（クリックで展開）"):
-        st.markdown(f"**波形分類: {waveform_type}**")
-        st.caption(f"説明: {waveform_comment}")
+        wf_type, wf_comment = classify_waveform(psv, edv, pi, fv)
+        st.markdown(f"**波形分類:** {wf_type}")
+        st.caption(f"説明: {wf_comment}")
