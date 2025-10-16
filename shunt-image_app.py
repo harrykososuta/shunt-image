@@ -1,133 +1,55 @@
+
 import streamlit as st
-import easyocr
+import pytesseract
 import numpy as np
 from PIL import Image
 import cv2
 import re
 from collections import OrderedDict
 
-reader = easyocr.Reader(['en'])
-
 # =============================
-# OCR処理関連
+# OCR処理関連（pytesseract使用）
 # =============================
 
 def pil_to_cv(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
-def extract_number(text):
-    if not isinstance(text, str):
-        text = str(text)
-    matches = re.findall(r"\d+\.\d+", text.replace(",", ""))
-    if matches:
-        return float(matches[0])
-    return None
+def preprocess_image(img_cv):
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 3)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
 
-KEYWORDS_BY_MANUFACTURER = {
-    "GEヘルスケア": {
-        "PSV": ["PS", "P5", "PSV"],
-        "EDV": ["ED", "EDV"],
-        "TAMV": ["TAMAX", "TA MAX"],
-        "TAV": ["TAMEAN", "TA MEAN"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["FV"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
-    },
-    "FUJIFILM": {
-        "PSV": ["PSV"],
-        "EDV": ["Ved"],
-        "TAMV": ["TAP"],
-        "TAV": ["TAM"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["VF"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
-    },
-    "コミカミノルタ": {
-        "PSV": ["PSV"],
-        "EDV": ["Ved"],
-        "TAMV": ["Vm-peak"],
-        "TAV": ["Vm-mean"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["FVol"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
-    }
-}
+def extract_text_from_image(img_cv):
+    preprocessed = preprocess_image(img_cv)
+    custom_config = r'--oem 3 --psm 6'
+    return pytesseract.image_to_string(preprocessed, config=custom_config)
 
-def extract_parameters(img_pil, manufacturer):
-    img_cv = pil_to_cv(img_pil)
-    h, w = img_cv.shape[:2]
-    roi = img_cv[int(h * 0.05):int(h * 0.55), int(w * 0.02):int(w * 0.45)]
-
-    results = reader.readtext(roi)
-    lines = [(text.strip(), conf) for _, text, conf in results if conf > 0.3]
-
-    keywords = KEYWORDS_BY_MANUFACTURER[manufacturer]
-    extracted = {}
-    full_text = " ".join([t for t, _ in lines])
-
-    # ---- 行単位マッチング ----
-    for key, variations in keywords.items():
-        for label, conf in lines:
-            if any(kw.lower() in label.lower() for kw in variations):
-                value = extract_number(label)
-                if value is not None:
-                    extracted[key] = value
-                    break
-
-    # ---- 隣接行で値を補完 ----
-    for i in range(len(lines) - 1):
-        label, _ = lines[i]
-        value_line, _ = lines[i + 1]
-        for key, variations in keywords.items():
-            if any(kw.lower() in label.lower() for kw in variations):
-                value = extract_number(value_line)
-                if value is not None:
-                    extracted[key] = value
-
-    # ---- OCR全文から正規表現でパラメータ補完 ----
-    pattern_map = {
-        "PSV": r"PS[V]?\s*[:=]?\s*(\d+\.\d+)",
-        "EDV": r"ED\s*[:=]?\s*(\d+\.\d+)",
-        "TAMV": r"TAMAX\s*[:=]?\s*(\d+\.\d+)",
-        "TAV": r"TAMEAN\s*[:=]?\s*(\d+\.\d+)",
-        "PI": r"PI\s*[:=]?\s*(\d+\.\d+)",
-        "RI": r"RI\s*[:=]?\s*(\d+\.\d+)",
-        "FV": r"FV\s*[:=]?\s*(\d+\.\d+)",
-        "VF_Diam": r"VF\s*Diam\s*[:=]?\s*(\d+\.\d+)"
+def extract_parameters_from_text(text):
+    pattern_dict = {
+        "PSV": r"(?:PSV|PS)[^\d]*(\d+\.\d+)",
+        "EDV": r"(?:EDV|ED)[^\d]*(\d+\.\d+)",
+        "TAMV": r"(?:TAMAX|TAMV|TA MAX)[^\d]*(\d+\.\d+)",
+        "TAV": r"(?:TAMEAN|TAV|TA MEAN)[^\d]*(\d+\.\d+)",
+        "PI": r"PI[^\d]*(\d+\.\d+)",
+        "RI": r"RI[^\d]*(\d+\.\d+)",
+        "FV": r"FV[^\d]*(\d+\.\d+)",
+        "VF_Diam": r"VF\s*Diam[^\d]*(\d+\.\d+)"
     }
 
-    for key, pattern in pattern_map.items():
-        if key not in extracted:
-            m = re.search(pattern, full_text)
-            if m:
-                extracted[key] = float(m.group(1))
-
-    # ---- TAMVとTAV補正 ----
-    if "TAMV" in extracted and "TAV" in extracted:
-        if extracted["TAMV"] == extracted["TAV"]:
-            extracted["TAV"] = extracted["TAMV"] * 0.7
-
-    ordered = OrderedDict()
-    for key in ["PSV", "EDV", "TAMV", "TAV", "RI", "PI", "FV", "VF_Diam"]:
-        if key in extracted:
-            ordered[key] = extracted[key]
-
-    return ordered, results
-
+    extracted = OrderedDict()
+    for key, pattern in pattern_dict.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            extracted[key] = float(match.group(1))
+    return extracted
 
 # =============================
 # Streamlit UI
 # =============================
 
 st.set_page_config(page_title="シャントOCR", layout="centered")
-st.title("🩺 シャント画像の数値自動抽出＆診断")
-
-st.sidebar.title("⚙️ メーカー設定")
-manufacturer = st.sidebar.selectbox("画像のメーカーを選択してください",
-                                    ["GEヘルスケア", "FUJIFILM", "コミカミノルタ"])
+st.title("🩺 シャント画像の数値自動抽出＆診断（pytesseract）")
 
 uploaded = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
 
@@ -136,13 +58,19 @@ if uploaded:
     st.image(img, caption="入力画像", use_container_width=True)
 
     with st.spinner("OCR解析中..."):
-        params, raw = extract_parameters(img, manufacturer)
+        img_cv = pil_to_cv(img)
+        ocr_text = extract_text_from_image(img_cv)
+        params = extract_parameters_from_text(ocr_text)
 
     st.subheader("📊 抽出されたパラメータ")
     if params:
         st.json(params)
     else:
         st.warning("パラメータが見つかりませんでした")
+
+    st.subheader("📝 OCR全文")
+    st.text_area("OCR結果全文", ocr_text, height=300)
+
 
     # ===== 評価スコア =====
     st.subheader("🔍 自動評価スコア")
@@ -252,3 +180,4 @@ if uploaded:
                 st.info(ai_main_comment)
                 for sup in ai_supplement:
                     st.info(sup)
+
