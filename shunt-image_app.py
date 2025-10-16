@@ -6,14 +6,21 @@ import cv2
 import re
 from collections import OrderedDict
 
-reader = easyocr.Reader(['en'])
-
 # =============================
 # OCR処理関連
 # =============================
 
+reader = easyocr.Reader(['en'], gpu=False)  # GPUなしでも安定動作
+
 def pil_to_cv(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+def preprocess_for_ocr(cv_img):
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
 
 def extract_number(text):
     if not isinstance(text, str):
@@ -33,42 +40,24 @@ KEYWORDS_BY_MANUFACTURER = {
         "RI": ["RI"],
         "FV": ["FV"],
         "VF_Diam": ["VF Diam", "VF", "VFD"]
-    },
-    "FUJIFILM": {
-        "PSV": ["PSV"],
-        "EDV": ["Ved"],
-        "TAMV": ["TAP"],
-        "TAV": ["TAM"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["VF"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
-    },
-    "コミカミノルタ": {
-        "PSV": ["PSV"],
-        "EDV": ["Ved"],
-        "TAMV": ["Vm-peak"],
-        "TAV": ["Vm-mean"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["FVol"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
     }
 }
 
 def extract_parameters(img_pil, manufacturer):
     img_cv = pil_to_cv(img_pil)
     h, w = img_cv.shape[:2]
-    roi = img_cv[int(h * 0.05):int(h * 0.55), int(w * 0.02):int(w * 0.45)]
+    # ROI範囲を拡大（左パネル全体カバー）
+    roi = img_cv[int(h * 0.05):int(h * 0.65), int(w * 0.01):int(w * 0.48)]
+    preprocessed = preprocess_for_ocr(roi)
 
-    results = reader.readtext(roi)
+    results = reader.readtext(preprocessed)
     lines = [(text.strip(), conf) for _, text, conf in results if conf > 0.3]
+    full_text = " ".join([t for t, _ in lines])
 
     keywords = KEYWORDS_BY_MANUFACTURER[manufacturer]
     extracted = {}
-    full_text = " ".join([t for t, _ in lines])
 
-    # ---- 行単位マッチング ----
+    # ラベル付き行の直接マッチ
     for key, variations in keywords.items():
         for label, conf in lines:
             if any(kw.lower() in label.lower() for kw in variations):
@@ -77,7 +66,7 @@ def extract_parameters(img_pil, manufacturer):
                     extracted[key] = value
                     break
 
-    # ---- 隣接行で値を補完 ----
+    # ラベル＋値の2行セットを補完
     for i in range(len(lines) - 1):
         label, _ = lines[i]
         value_line, _ = lines[i + 1]
@@ -87,10 +76,10 @@ def extract_parameters(img_pil, manufacturer):
                 if value is not None:
                     extracted[key] = value
 
-    # ---- OCR全文から正規表現でパラメータ補完 ----
+    # 正規表現での最終補完
     pattern_map = {
         "PSV": r"PS[V]?\s*[:=]?\s*(\d+\.\d+)",
-        "EDV": r"ED\s*[:=]?\s*(\d+\.\d+)",
+        "EDV": r"ED[V]?\s*[:=]?\s*(\d+\.\d+)",
         "TAMV": r"TAMAX\s*[:=]?\s*(\d+\.\d+)",
         "TAV": r"TAMEAN\s*[:=]?\s*(\d+\.\d+)",
         "PI": r"PI\s*[:=]?\s*(\d+\.\d+)",
@@ -105,18 +94,18 @@ def extract_parameters(img_pil, manufacturer):
             if m:
                 extracted[key] = float(m.group(1))
 
-    # ---- TAMVとTAV補正 ----
+    # TAMVとTAVの補正
     if "TAMV" in extracted and "TAV" in extracted:
-        if extracted["TAMV"] == extracted["TAV"]:
+        if abs(extracted["TAMV"] - extracted["TAV"]) < 0.5:
             extracted["TAV"] = extracted["TAMV"] * 0.7
 
+    # 表示順を整える
     ordered = OrderedDict()
     for key in ["PSV", "EDV", "TAMV", "TAV", "RI", "PI", "FV", "VF_Diam"]:
         if key in extracted:
             ordered[key] = extracted[key]
 
     return ordered, results
-
 
 # =============================
 # Streamlit UI
@@ -126,8 +115,7 @@ st.set_page_config(page_title="シャントOCR", layout="centered")
 st.title("🩺 シャント画像の数値自動抽出＆診断")
 
 st.sidebar.title("⚙️ メーカー設定")
-manufacturer = st.sidebar.selectbox("画像のメーカーを選択してください",
-                                    ["GEヘルスケア", "FUJIFILM", "コミカミノルタ"])
+manufacturer = st.sidebar.selectbox("画像のメーカーを選択してください", ["GEヘルスケア"])
 
 uploaded = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
 
@@ -252,3 +240,4 @@ if uploaded:
                 st.info(ai_main_comment)
                 for sup in ai_supplement:
                     st.info(sup)
+
