@@ -252,5 +252,3 @@ if uploaded:
                 st.info(ai_main_comment)
                 for sup in ai_supplement:
                     st.info(sup)
-
-       
