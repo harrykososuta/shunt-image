@@ -4,6 +4,7 @@ import numpy as np
 from PIL import Image
 import cv2
 import re
+import math
 
 reader = easyocr.Reader(['en'])
 
@@ -19,36 +20,9 @@ def extract_number(text):
     return None
 
 KEYWORDS_BY_MANUFACTURER = {
-    "GEヘルスケア": {
-        "PSV": ["PS", "P5", "PSV"],
-        "EDV": ["ED", "EDV"],
-        "TAMV": ["TAMAX", "TA MAX"],
-        "TAV": ["TAMEAN", "TAV"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["FV"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
-    },
-    "FUJIFILM": {
-        "PSV": ["PS", "P5", "PSV"],
-        "EDV": ["Ved"],
-        "TAMV": ["TAP"],
-        "TAV": ["TAM"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["VF"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
-    },
-    "コミカミノルタ": {
-        "PSV": ["PS", "P5", "PSV"],
-        "EDV": ["Ved"],
-        "TAMV": ["Vm-peak"],
-        "TAV": ["Vm-mean"],
-        "PI": ["PI"],
-        "RI": ["RI"],
-        "FV": ["FVol"],
-        "VF_Diam": ["VF Diam", "VF", "VFD"]
-    }
+    "GEヘルスケア": { "PSV": ["PS", "P5", "PSV"], "EDV": ["ED", "EDV"], "TAMV": ["TAMAX", "TA MAX"], "TAV": ["TAMEAN", "TAV"], "PI": ["PI"], "RI": ["RI"], "FV": ["FV"], "VF_Diam": ["VF Diam", "VF", "VFD"] },
+    "FUJIFILM": { "PSV": ["PS", "P5", "PSV"], "EDV": ["Ved"], "TAMV": ["TAP"], "TAV": ["TAM"], "PI": ["PI"], "RI": ["RI"], "FV": ["VF"], "VF_Diam": ["VF Diam", "VF", "VFD"] },
+    "コミカミノルタ": { "PSV": ["PS", "P5", "PSV"], "EDV": ["Ved"], "TAMV": ["Vm-peak"], "TAV": ["Vm-mean"], "PI": ["PI"], "RI": ["RI"], "FV": ["FVol"], "VF_Diam": ["VF Diam", "VF", "VFD"] }
 }
 
 def extract_parameters(img_pil, manufacturer):
@@ -57,16 +31,20 @@ def extract_parameters(img_pil, manufacturer):
     roi = img_cv[int(h * 0.05):int(h * 0.6), int(w * 0.01):int(w * 0.5)]
     results = reader.readtext(roi)
 
-    lines = [(bbox, text.strip(), conf) for bbox, text, conf in results if conf > 0.4]
+    # Debug: 出力確認
+    # st.write("OCR結果 raw:", results)
+
+    lines = [(bbox, text.strip(), conf) for bbox, text, conf in results if conf > 0.3]
     keywords = KEYWORDS_BY_MANUFACTURER[manufacturer]
     extracted = {}
     used_labels = set()
 
+    # ① ラベル → 近傍値ペアリング
     for i, (bbox_i, text_i, conf_i) in enumerate(lines):
         for key, variations in keywords.items():
             if any(kw.lower() in text_i.lower() for kw in variations):
-                candidate = None
-                best_dist = None
+                best_val = None
+                best_score = None
                 for j, (bbox_j, text_j, conf_j) in enumerate(lines):
                     if j == i:
                         continue
@@ -77,15 +55,23 @@ def extract_parameters(img_pil, manufacturer):
                     cy_i = np.mean([pt[1] for pt in bbox_i])
                     cx_j = np.mean([pt[0] for pt in bbox_j])
                     cy_j = np.mean([pt[1] for pt in bbox_j])
-                    dist = abs(cy_j - cy_i) + abs(cx_j - cx_i) * 0.5
-                    if best_dist is None or dist < best_dist:
-                        candidate = val
-                        best_dist = dist
-                if candidate is not None:
-                    extracted[key] = candidate
+                    # 距離スコア（縦優先 + 横補正）
+                    score = abs(cy_j - cy_i) * 2 + abs(cx_j - cx_i)
+                    # 範囲フィルタ：val が常識範囲内
+                    if key == "PSV" and not (5 <= val <= 300):
+                        continue
+                    if key == "EDV" and not (0 <= val <= 200):
+                        continue
+                    if key == "FV" and not (0 < val <= 5000):
+                        continue
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_val = val
+                if best_val is not None:
+                    extracted[key] = best_val
                     used_labels.add(i)
 
-    # 横並びと縦並び補助
+    # ② 横並び／縦補助 fallback
     used_indices = set()
     for idx, (bbox, text, conf) in enumerate(lines):
         for key, variations in keywords.items():
@@ -122,7 +108,7 @@ def classify_waveform(psv, edv, pi, fv):
     else:
         return "Type II", "良好波形型（Ⅱ型）：EDV保たれ、PI正常域"
 
-# ========== Streamlit UI ==========
+# ========== UI 部分 ==========
 st.set_page_config(page_title="シャントOCR", layout="centered")
 st.title("🩺 シャント画像の数値自動抽出＆診断")
 
@@ -144,7 +130,7 @@ if uploaded:
     else:
         st.warning("パラメータが見つかりませんでした")
 
-    # -------- 自動評価コード --------
+    # 自動評価スコア（既存コード）
     st.subheader("🔍 自動評価スコア")
     form = {k.lower(): v for k, v in params.items()}
     score = 0
@@ -176,7 +162,7 @@ if uploaded:
         for level, comment in comments:
             st.warning(f"- {comment}")
 
-    # -------- AI診断コメント --------
+    # AI診断コメント
     tav = form.get("tav", 0)
     tamv = form.get("tamv", 1)
     ri = form.get("ri", 0)
@@ -196,33 +182,32 @@ if uploaded:
                 if tav < 34.5 and edv < 40.4 and ri >= 0.68 and pi >= 1.3:
                     ai_main_comment = "TAVとEDVの低下。RIとPIの上昇。早急なVAIVT提案が必要です。"
                 elif tav < 34.5 and pi >= 1.3 and edv < 40.4:
-                    ai_main_comment = "TAVとEDVの低下 + PI上昇 → 高度吻合部狭窄が疑われます。"
+                    ai_main_comment = "TAV低下 + EDV低下 + PI上昇 → 高度吻合部狭窄が疑われます。"
                 elif tav < 34.5 and pi >= 1.3:
-                    ai_main_comment = "TAVの低下 + PI上昇 → 吻合部近傍の高度狭窄が疑われます"
+                    ai_main_comment = "TAV低下 + PI上昇 → 吻合部近傍狭窄の疑い"
                 elif tav < 34.5 and edv < 40.4:
-                    ai_main_comment = "TAVとEDVが低下しており、中等度の吻合部狭窄が疑われます"
+                    ai_main_comment = "TAVとEDV低下 → 中等度吻合部狭窄が疑われます"
                 elif ri >= 0.68 and edv < 40.4:
-                    ai_main_comment = "RI高値 × EDV低下 → 末梢側狭窄が疑われます"
+                    ai_main_comment = "RI高値 + EDV低下 → 末梢側狭窄が疑われます"
                 elif score == 0:
-                    ai_main_comment = "正常です。経過観察を推奨します。"
+                    ai_main_comment = "正常範囲と判断します。経過観察を。"
                 else:
-                    ai_main_comment = "一部パラメータに変化あり。再評価が望まれます。"
+                    ai_main_comment = "特記すべき高度異常は認められませんが、一部値が変化しています。"
 
                 st.info(f"🧠 主コメント: {ai_main_comment}")
-
                 if tav < 25 and 500 <= fv <= 1000:
-                    ai_supplement.append("TAVが非常に低いがFV正常 → 過大評価の可能性あり")
+                    ai_supplement.append("TAV非常に低値 ＋ FV正常 → 過大評価の可能性")
                 if fv > 1500:
-                    ai_supplement.append("FV高値 → large shunt の可能性あり")
+                    ai_supplement.append("FV高値 → large shunt 可能性")
                 if ri >= 0.68 and pi >= 1.3 and fv >= 400 and tav >= 50:
-                    ai_supplement.append("RI・PI高いがFV・TAV正常 → 分岐血管かも。遮断試験検討")
+                    ai_supplement.append("RI・PI高でも TAV/FV 正常 → 分岐血管影響？遮断試験検討")
 
                 if ai_supplement:
                     st.write("#### 💬 補足コメント")
                     for sup in ai_supplement:
                         st.write(f"- {sup}")
 
-    # -------- 波形分類セクション --------
+    # 波形分類表示
     st.subheader("📈 波形分類結果")
     with st.expander("📊 波形分類と説明（クリックで展開）"):
         psv = params.get("PSV") or params.get("psv") or 0
