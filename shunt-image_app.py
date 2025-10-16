@@ -1,87 +1,66 @@
 import streamlit as st
-import numpy as np
-import pytesseract
 from PIL import Image
+import pytesseract
+import numpy as np
 import cv2
 import re
-from collections import OrderedDict
 
 # =============================
-# OCR処理（pytesseractベース）
+# OCR 前処理関数
 # =============================
-def pil_to_cv(pil_image):
-    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+def preprocess_for_ocr(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    blur = cv2.GaussianBlur(resized, (3, 3), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
 
-def preprocess_img_for_tesseract(cv_img):
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
-
-def extract_number(text):
-    matches = re.findall(r"\d+\.\d+", text.replace(",", ""))
-    if matches:
-        return float(matches[0])
-    return None
-
-def extract_parameters_with_tesseract(img_pil):
-    img_cv = pil_to_cv(img_pil)
-    h, w = img_cv.shape[:2]
-    roi = img_cv[int(h * 0.05):int(h * 0.55), int(w * 0.02):int(w * 0.45)]
-
-    preprocessed = preprocess_img_for_tesseract(roi)
-    text = pytesseract.image_to_string(preprocessed, config="--psm 6")
-
-    pattern_map = {
-        "PSV": r"PS[V]?[ :=]+(\d+\.\d+)",
-        "EDV": r"ED[V]?[ :=]+(\d+\.\d+)",
-        "TAMV": r"TAMAX[ :=]+(\d+\.\d+)",
-        "TAV": r"TAMEAN[ :=]+(\d+\.\d+)",
-        "PI": r"PI[ :=]+(\d+\.\d+)",
-        "RI": r"RI[ :=]+(\d+\.\d+)",
-        "FV": r"FV[ :=]+(\d+\.\d+)",
-        "VF_Diam": r"VF\s*Diam[ :=]+(\d+\.\d+)"
+# =============================
+# パラメータ抽出関数
+# =============================
+def extract_parameters_from_text(text):
+    patterns = {
+        "PSV": r"PS[V]?\s*[:=]?\s*(\d+\.\d+)",
+        "EDV": r"ED[V]?\s*[:=]?\s*(\d+\.\d+)",
+        "TAMV": r"TAMAX\s*[:=]?\s*(\d+\.\d+)",
+        "TAV": r"TAMEAN\s*[:=]?\s*(\d+\.\d+)",
+        "PI": r"PI\s*[:=]?\s*(\d+\.\d+)",
+        "RI": r"RI\s*[:=]?\s*(\d+\.\d+)",
+        "FV": r"FV\s*[:=]?\s*(\d+\.\d+)",
+        "VF_Diam": r"VF\s*Diam\s*[:=]?\s*(\d+\.\d+)"
     }
-
     extracted = {}
-    for key, pattern in pattern_map.items():
+    for key, pattern in patterns.items():
         match = re.search(pattern, text)
         if match:
             extracted[key] = float(match.group(1))
-
-    if "TAMV" in extracted and "TAV" in extracted:
-        if extracted["TAMV"] == extracted["TAV"]:
-            extracted["TAV"] = extracted["TAMV"] * 0.7
-
-    ordered = OrderedDict()
-    for key in ["PSV", "EDV", "TAMV", "TAV", "RI", "PI", "FV", "VF_Diam"]:
-        if key in extracted:
-            ordered[key] = extracted[key]
-
-    return ordered
+    return extracted
 
 # =============================
 # Streamlit UI
 # =============================
-st.set_page_config(page_title="シャントOCR (pytesseract版)", layout="centered")
-st.title("🩺 シャント画像の数値自動抽出 (pytesseract)")
+st.set_page_config(page_title="シャントOCR", layout="centered")
+st.title("🩺 シャント画像の数値自動抽出＆診断")
 
-uploaded = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
+if uploaded_file:
+    image_pil = Image.open(uploaded_file).convert("RGB")
+    image_np = np.array(image_pil)
+    h, w = image_np.shape[:2]
+    roi = image_np[0:int(h * 0.5), 0:int(w * 0.4)]
 
-if uploaded:
-    img = Image.open(uploaded).convert("RGB")
-    st.image(img, caption="入力画像", use_container_width=True)
+    st.image(roi, caption="数値エリア（自動抽出）", use_container_width=True)
 
-    with st.spinner("OCR解析中 (pytesseract)..."):
-        params = extract_parameters_with_tesseract(img)
+    processed = preprocess_for_ocr(roi)
+    text = pytesseract.image_to_string(processed)
+
+    params = extract_parameters_from_text(text)
 
     st.subheader("📊 抽出されたパラメータ")
     if params:
         st.json(params)
     else:
         st.warning("パラメータが見つかりませんでした")
-
 
 
     # ===== 評価スコア =====
@@ -192,5 +171,6 @@ if uploaded:
                 st.info(ai_main_comment)
                 for sup in ai_supplement:
                     st.info(sup)
+
 
 
