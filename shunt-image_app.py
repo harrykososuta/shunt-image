@@ -1,9 +1,9 @@
 import streamlit as st
 import easyocr
 import numpy as np
-import re
 from PIL import Image
 import cv2
+import re
 
 reader = easyocr.Reader(['en'])
 
@@ -15,6 +15,7 @@ def extract_number(text):
         text = str(text) if text is not None else ""
     matches = re.findall(r"\d+\.\d+", text.replace(",", ""))
     if matches:
+        # 複数候補があれば最大のものを採用
         return float(max(matches, key=lambda x: float(x)))
     return None
 
@@ -54,11 +55,12 @@ KEYWORDS_BY_MANUFACTURER = {
 def extract_parameters(img_pil, manufacturer):
     img_cv = pil_to_cv(img_pil)
     h, w = img_cv.shape[:2]
+    # OCR対象領域を若干広めに取る
     roi = img_cv[int(h * 0.05):int(h * 0.6), int(w * 0.01):int(w * 0.5)]
     results = reader.readtext(roi)
 
-    # Debug 全体出力
-    st.write("OCR raw:", results)
+    # --- **ここで raw 表示はしない** ---
+    # st.write("OCR raw:", results)  # ← この行を削除またはコメントアウト
 
     lines = [(bbox, text.strip(), conf) for bbox, text, conf in results if conf > 0.2]
     keywords = KEYWORDS_BY_MANUFACTURER[manufacturer]
@@ -81,17 +83,21 @@ def extract_parameters(img_pil, manufacturer):
                     cy_i = np.mean([pt[1] for pt in bbox_i])
                     cx_j = np.mean([pt[0] for pt in bbox_j])
                     cy_j = np.mean([pt[1] for pt in bbox_j])
-                    # 距離スコア（縦優先重み強め）
+                    # 距離スコア（縦方向優先 + 横補正）
                     score = abs(cy_j - cy_i) * 2 + abs(cx_j - cx_i)
-                    # 単位補正：text_j に “ml/min” や “cm/s” があればスコア優遇
-                    if "ml/min" in text_j:
-                        if key == "FV":
-                            score *= 0.5
-                    if "cm/s" in text_j:
-                        if key in ("PSV", "EDV", "TAV", "TAMV"):
-                            score *= 0.5
-                    # 範囲チェック
+                    # 単位補正：近傍テキストに "cm/s" や "ml/min" が含まれていれば重み低下
+                    if "ml/min" in text_j and key == "FV":
+                        score *= 0.5
+                    if "cm/s" in text_j and key in ("PSV", "EDV", "TAV", "TAMV"):
+                        score *= 0.5
+                    # 範囲チェック（常識的な範囲をはみ出す値を除外）
                     if key == "RI" and not (0 <= val <= 5):
+                        continue
+                    if key == "PSV" and not (5 <= val <= 300):
+                        continue
+                    if key == "EDV" and not (0 <= val <= 200):
+                        continue
+                    if key == "FV" and not (0 < val <= 5000):
                         continue
                     if best_score is None or score < best_score:
                         best_score = score
@@ -100,7 +106,7 @@ def extract_parameters(img_pil, manufacturer):
                     extracted[key] = best_val
                     used_labels.add(i)
 
-    # フォールバック横／縦補助
+    # フォールバック：横並び補助・縦補助
     used_indices = set()
     for idx, (bbox, text, conf) in enumerate(lines):
         for key, variations in keywords.items():
@@ -109,6 +115,7 @@ def extract_parameters(img_pil, manufacturer):
                 if value is not None and key not in extracted:
                     extracted[key] = value
                     used_indices.add(idx)
+
     for idx, (bbox, label_text, conf) in enumerate(lines):
         for key, variations in keywords.items():
             if any(kw.lower() in label_text.lower() for kw in variations):
@@ -120,41 +127,43 @@ def extract_parameters(img_pil, manufacturer):
                         extracted[key] = value
                         used_indices.add(j)
 
-    # バックアップ方式：raw テキスト結合で “PS 93.48” 等を探す
-    full_text = " ".join([text for (_, text, _) in lines])
-    # PSV パターン
-    m = re.search(r"PS\s*(\d+\.\d+)", full_text)
-    if m and "PSV" not in extracted:
-        extracted["PSV"] = float(m.group(1))
-    m2 = re.search(r"ED\s*(\d+\.\d+)", full_text)
-    if m2 and "EDV" not in extracted:
-        extracted["EDV"] = float(m2.group(1))
-    m3 = re.search(r"FV\s*(\d+\.\d+)", full_text)
-    if m3 and "FV" not in extracted:
-        extracted["FV"] = float(m3.group(1))
+    # バックアップ：全文テキスト結合から PS, ED, FV 等を正規表現探索
+    full_text = " ".join([text for (bbox, text, conf) in lines])
+    m_ps = re.search(r"PS\s*(\d+\.\d+)", full_text)
+    if m_ps and "PSV" not in extracted:
+        extracted["PSV"] = float(m_ps.group(1))
+    m_ed = re.search(r"ED\s*(\d+\.\d+)", full_text)
+    if m_ed and "EDV" not in extracted:
+        extracted["EDV"] = float(m_ed.group(1))
+    m_fv = re.search(r"FV\s*(\d+\.\d+)", full_text)
+    if m_fv and "FV" not in extracted:
+        extracted["FV"] = float(m_fv.group(1))
 
     return extracted, results
 
 def classify_waveform(psv, edv, pi, fv):
     if edv < 5 and fv < 100:
-        return "Type V", "閉塞型（Ⅴ型）：EDV ≒ 0, 流量非常に低"
+        return "Type V", "閉塞型（Ⅴ型）：EDVほぼゼロ・流量非常に低い"
     elif fv > 1500:
-        return "Type I", "過大血流型（Ⅰ型）：FV が大きい"
+        return "Type I", "過大血流型（Ⅰ型）：FV が 1500 を超える"
     elif pi >= 1.3 and edv < 40.4:
-        return "Type IV", "末梢狭窄型（Ⅳ型）：PI 高め、EDV 低め"
+        return "Type IV", "末梢狭窄型（Ⅳ型）：PI 高値、EDV やや低下"
     elif pi >= 1.3:
-        return "Type III", "狭窄型（Ⅲ型）：PI 高め"
+        return "Type III", "狭窄傾向（Ⅲ型）：PI 高値"
     elif fv < 500 and edv < 40.4:
-        return "Type IV", "末梢狭窄型（Ⅳ型）：FV 低め & EDV 低め"
+        return "Type IV", "末梢狭窄型（Ⅳ型）：FV 低値 & EDV やや低下"
     else:
-        return "Type II", "中等型（Ⅱ型）：EDV 保たれ、PI 普通"
+        return "Type II", "良好波形型（Ⅱ型）：EDV 保たれ、PI 正常域"
 
-# UI 部分
+# ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="シャントOCR", layout="centered")
 st.title("🩺 シャント画像の数値自動抽出＆診断")
 
 st.sidebar.title("⚙️ メーカー設定")
-manufacturer = st.sidebar.selectbox("画像のメーカーを選択してください", ["GEヘルスケア", "FUJIFILM", "コミカミノルタ"])
+manufacturer = st.sidebar.selectbox(
+    "画像のメーカーを選択してください",
+    ["GEヘルスケア", "FUJIFILM", "コミカミノルタ"]
+)
 
 uploaded = st.file_uploader("画像をアップロード", type=["jpg", "jpeg", "png"])
 
@@ -171,39 +180,38 @@ if uploaded:
     else:
         st.warning("パラメータが見つかりませんでした")
 
-    # 自動評価
+    # 自動評価スコア（そのまま使う）
     st.subheader("🔍 自動評価スコア")
     form = {k.lower(): v for k, v in params.items()}
     score = 0
     comments = []
     if form.get("tav", 999) <= 34.5:
         score += 1
-        comments.append(("warning", "TAV が 34.5 cm/s 以下 → 低血流疑い"))
+        comments.append(("warning", "TAVが34.5 cm/s以下 → 低血流が疑われる"))
     if form.get("ri", 0) >= 0.68:
         score += 1
-        comments.append(("warning", "RI が 0.68 以上 → 高抵抗疑い"))
+        comments.append(("warning", "RIが0.68以上 → 高抵抗が疑われる"))
     if form.get("pi", 0) >= 1.3:
         score += 1
-        comments.append(("warning", "PI が 1.3 以上 → 波形異常"))
+        comments.append(("warning", "PIが1.3以上 → 脈波指数異常"))
     if form.get("edv", 999) <= 40.4:
         score += 1
-        comments.append(("warning", "EDV が 40.4 cm/s 以下 → 拡張期血流低下"))
+        comments.append(("warning", "EDVが40.4 cm/s以下 → 拡張期血流速度低下"))
 
     st.write(f"評価スコア: {score} / 4")
     if score == 0:
-        st.success("🟢 正常：経過観察推奨")
-    elif score in [1,2]:
-        st.warning("🟡 要注意：追加評価必要")
+        st.success("🟢 正常：経過観察が推奨されます")
+    elif score in [1, 2]:
+        st.warning("🟡 要注意：追加評価が必要です")
     else:
-        st.error("🔴 高リスク：専門評価必要")
+        st.error("🔴 高リスク：専門的評価が必要です")
 
     if comments:
         st.write("### 評価コメント")
         for level, comment in comments:
-            if level == "warning":
-                st.warning(f"- {comment}")
+            st.warning(f"- {comment}")
 
-    # AI診断
+    # AI診断コメント（そのまま使う）
     tav = form.get("tav", 0)
     tamv = form.get("tamv", 1)
     ri = form.get("ri", 0)
@@ -212,40 +220,40 @@ if uploaded:
     edv = form.get("edv", 0)
 
     with st.container(border=True):
-        with st.expander("🤖 AI診断コメント"):
+        with st.expander("🤖 AIによる診断コメント"):
             if st.button("AI診断を実行"):
-                ai_main = ""
-                supplement = []
+                ai_main_comment = ""
+                ai_supplement = []
                 if tav < 34.5 and edv < 40.4 and ri >= 0.68 and pi >= 1.3:
-                    ai_main = "TAV, EDV 低下、RI, PI 上昇あり。VAIVT を強く検討。"
+                    ai_main_comment = "TAVとEDVが低下、RIとPIが上昇。VAIVT を早急に検討してください。"
                 elif tav < 34.5 and pi >= 1.3 and edv < 40.4:
-                    ai_main = "TAV, EDV 低下 + PI 上昇 → 高度狭窄疑い"
+                    ai_main_comment = "TAV & EDV 低下 + PI 上昇 → 高度狭窄疑い"
                 elif tav < 34.5 and pi >= 1.3:
-                    ai_main = "TAV 低下 + PI 上昇 → 狭窄疑い"
+                    ai_main_comment = "TAV 低下 + PI 上昇 → 狭窄疑い"
                 elif tav < 34.5 and edv < 40.4:
-                    ai_main = "TAV・EDV 低下 → 中等度狭窄疑い"
+                    ai_main_comment = "TAV と EDV が低下 → 中等度狭窄疑い"
                 elif ri >= 0.68 and edv < 40.4:
-                    ai_main = "RI 高値 + EDV 低下 → 末梢狭窄疑い"
+                    ai_main_comment = "RI 高値 + EDV 低下 → 末梢狭窄可能性"
                 elif score == 0:
-                    ai_main = "正常範囲と判断"
+                    ai_main_comment = "正常範囲内と判断されます。"
                 else:
-                    ai_main = "明確な高度異常なし。ただし変動あり"
+                    ai_main_comment = "特記すべき異常所見はありませんが、一部パラメータに変動があります。"
 
-                st.info(f"🧠 主コメント: {ai_main}")
+                st.info(f"🧠 主コメント: {ai_main_comment}")
 
                 if tav < 25 and 500 <= fv <= 1000:
-                    supplement.append("TAV 極めて低値、FV 正常 → 血管径の影響かも")
+                    ai_supplement.append("TAV 非常に低値、FV 正常圏 → 血管径影響かも")
                 if fv > 1500:
-                    supplement.append("FV 高値 → large shunt 可能性")
+                    ai_supplement.append("FV 高値 → large shunt の可能性")
                 if ri >= 0.68 and pi >= 1.3 and fv >= 400 and tav >= 50:
-                    supplement.append("RI・PI 高値だが TAV/FV 正常 → 分岐血管影響可能")
+                    ai_supplement.append("RI・PI 高値だが TAV/FV 正常 → 分岐血管影響かも")
 
-                if supplement:
+                if ai_supplement:
                     st.write("#### 補足コメント")
-                    for s in supplement:
-                        st.write(f"- {s}")
+                    for sup in ai_supplement:
+                        st.write(f"- {sup}")
 
-    # 波形分類
+    # 波形分類表示
     st.subheader("📈 波形分類結果")
     with st.expander("📊 波形分類と説明"):
         psv = params.get("PSV") or params.get("psv") or 0
