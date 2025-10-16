@@ -1,5 +1,6 @@
 streamlit
 easyocr
+pytesseract
 torch
 torchvision
 opencv-python-headless
