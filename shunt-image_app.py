@@ -68,6 +68,7 @@ def extract_parameters(img_pil, manufacturer):
     extracted = {}
     full_text = " ".join([t for t, _ in lines])
 
+    # ---- 行単位マッチング ----
     for key, variations in keywords.items():
         for label, conf in lines:
             if any(kw.lower() in label.lower() for kw in variations):
@@ -76,6 +77,7 @@ def extract_parameters(img_pil, manufacturer):
                     extracted[key] = value
                     break
 
+    # ---- 隣接行で値を補完 ----
     for i in range(len(lines) - 1):
         label, _ = lines[i]
         value_line, _ = lines[i + 1]
@@ -85,11 +87,25 @@ def extract_parameters(img_pil, manufacturer):
                 if value is not None:
                     extracted[key] = value
 
-    if "PI" not in extracted:
-        m = re.search(r"PI\s*[:=]?\s*(\d+\.\d+)", full_text)
-        if m:
-            extracted["PI"] = float(m.group(1))
+    # ---- OCR全文から正規表現でパラメータ補完 ----
+    pattern_map = {
+        "PSV": r"PS[V]?\s*[:=]?\s*(\d+\.\d+)",
+        "EDV": r"ED\s*[:=]?\s*(\d+\.\d+)",
+        "TAMV": r"TAMAX\s*[:=]?\s*(\d+\.\d+)",
+        "TAV": r"TAMEAN\s*[:=]?\s*(\d+\.\d+)",
+        "PI": r"PI\s*[:=]?\s*(\d+\.\d+)",
+        "RI": r"RI\s*[:=]?\s*(\d+\.\d+)",
+        "FV": r"FV\s*[:=]?\s*(\d+\.\d+)",
+        "VF_Diam": r"VF\s*Diam\s*[:=]?\s*(\d+\.\d+)"
+    }
 
+    for key, pattern in pattern_map.items():
+        if key not in extracted:
+            m = re.search(pattern, full_text)
+            if m:
+                extracted[key] = float(m.group(1))
+
+    # ---- TAMVとTAV補正 ----
     if "TAMV" in extracted and "TAV" in extracted:
         if extracted["TAMV"] == extracted["TAV"]:
             extracted["TAV"] = extracted["TAMV"] * 0.7
@@ -100,6 +116,7 @@ def extract_parameters(img_pil, manufacturer):
             ordered[key] = extracted[key]
 
     return ordered, results
+
 
 # =============================
 # Streamlit UI
@@ -127,7 +144,7 @@ if uploaded:
     else:
         st.warning("パラメータが見つかりませんでした")
 
-    # 自動評価スコア
+    # ===== 評価スコア =====
     st.subheader("🔍 自動評価スコア")
     form = {k.lower(): v for k, v in params.items()}
     score = 0
@@ -159,7 +176,7 @@ if uploaded:
         for level, comment in comments:
             st.warning(f"- {comment}")
 
-    # 波形分類
+    # ===== 波形分類 =====
     st.subheader("📈 波形分類結果")
 
     def classify_waveform(psv, edv, pi, fv):
@@ -189,7 +206,7 @@ if uploaded:
             st.markdown("**波形分類:** 判定不能")
             st.caption("説明: パラメータが不足しています")
 
-    # ===== AI診断コメントセクション =====
+    # ===== AI診断コメント =====
     with st.container(border=True):
         with st.expander("🤖 AIによる診断コメントを表示 / 非表示"):
             if st.button("AI診断を実行"):
@@ -235,3 +252,27 @@ if uploaded:
                 st.info(ai_main_comment)
                 for sup in ai_supplement:
                     st.info(sup)
+
+        note = st.text_area("備考（自由記述）", placeholder="観察メモや特記事項などがあれば記入")
+
+        with st.expander("📌 追加情報を表示"):
+            TAVR = tav / tamv if tamv != 0 else 0
+            RI_PI = ri / pi if pi != 0 else 0
+
+            st.write("### TAVRの算出")
+            st.write(f"TAVR: {TAVR:.2f}")
+            st.write("### RI/PI の算出")
+            st.write(f"RI/PI: {RI_PI:.2f}")
+
+            st.write("### 波形分類")
+            st.markdown("""
+            - Ⅰ・Ⅱ型：シャント機能は問題なし  
+            - Ⅲ型：50％程度の狭窄があるため精査  
+            - Ⅳ型：VAIVT提案念頭に精査  
+            - Ⅴ型：シャント閉塞の可能性大
+            """)
+
+            st.write("### 追加コメント")
+            st.markdown("吻合部付近に2.0mmを超える分岐血管がある場合は遮断試験を行ってください")
+            st.write("### 補足コメント")
+            st.markdown("この補足は評価に必要な周辺知識を補完するものです。※検査時の注意点などをここにまとめられます")
